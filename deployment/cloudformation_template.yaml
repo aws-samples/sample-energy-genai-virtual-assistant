@@ -1,0 +1,1892 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates Amazon Timestream resources for meter data'
+
+Parameters:
+  ConnectInstanceArn:
+    Type: String
+    Description: ARN of the existing Amazon Connect instance
+
+  ConnectQueueArn:
+    Type: String
+    Description: ARN of the existing Amazon Connect queue
+
+Resources:
+  MeterDataTimestreamDatabase:
+    Type: AWS::Timestream::Database
+    Properties:
+      DatabaseName: MeterData
+
+  MeterDataTimestreamTable:
+    Type: AWS::Timestream::Table
+    Properties:
+      DatabaseName: !Ref MeterDataTimestreamDatabase
+      TableName: IntervalData
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: 2160
+        MagneticStoreRetentionPeriodInDays: 365
+      Schema:
+        CompositePartitionKey:
+          - EnforcementInRecord: REQUIRED
+            Name: MeterID
+            Type: DIMENSION
+
+  PopulateDataFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PopulateDataFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowAccessToTimestream
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:WriteRecords
+                Resource: !GetAtt MeterDataTimestreamTable.Arn
+              - Effect: Allow
+                Action:
+                  - timestream:DescribeEndpoints
+                Resource: "*"
+        - PolicyName: AllowDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: 
+                  - !GetAtt AccountDynamoDBTable.Arn
+                  - !GetAtt BillingDynamoDBTable.Arn
+  
+  AccountDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: AccountData
+      AttributeDefinitions:
+        - AttributeName: AccountNumber
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountNumber
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  BillingDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BillingData
+      AttributeDefinitions:
+        - AttributeName: AccountNumber
+          AttributeType: S
+        - AttributeName: BillingDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: AccountNumber
+          KeyType: HASH
+        - AttributeName: BillingDate
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        - IndexName: BillingDateIndex
+          KeySchema:
+            - AttributeName: BillingDate
+              KeyType: HASH
+            - AttributeName: AccountNumber
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  TicketDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: TicketData
+      AttributeDefinitions:
+        - AttributeName: TicketNumber
+          AttributeType: S
+        - AttributeName: AccountNumber
+          AttributeType: S
+        - AttributeName: CreationDate
+          AttributeType: S        
+      KeySchema:
+        - AttributeName: TicketNumber
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        - IndexName: AccountTicketsIndex
+          KeySchema:
+            - AttributeName: AccountNumber
+              KeyType: HASH
+            - AttributeName: CreationDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  PopulateDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: PopulateDataFunction
+      Description: Populates the Timestream and DynamoDB databases with sample data
+      Handler: index.lambda_handler
+      Role: !GetAtt PopulateDataFunctionRole.Arn
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          import cfnresponse
+          import random
+          from datetime import datetime, timedelta
+          import math
+          from decimal import Decimal
+
+          def generate_realistic_measurements():
+              # Nominal values
+              nominal_voltage = 120.0
+              nominal_frequency = 60.0
+              
+              # Generate realistic voltage values (typically ±5% of nominal)
+              L1Voltage = round(random.uniform(nominal_voltage * 0.95, nominal_voltage * 1.05), 6)
+              L2Voltage = round(random.uniform(nominal_voltage * 0.95, nominal_voltage * 1.05), 6)
+              L3Voltage = round(random.uniform(nominal_voltage * 0.95, nominal_voltage * 1.05), 6)
+              
+              # Time of day factor (0.0 to 1.0) to simulate daily load patterns
+              hour = datetime.now().hour
+              time_factor = 0.6 + 0.4 * math.sin((hour - 12) * math.pi / 12)  # Peak at noon, lowest at midnight
+              
+              # Generate realistic current values (0.5 to 20 amps, influenced by time of day)
+              base_current = random.uniform(0.5, 20.0) * time_factor
+              L1Current = round(random.uniform(base_current * 0.9, base_current * 1.1), 6)
+              L2Current = round(random.uniform(base_current * 0.9, base_current * 1.1), 6)
+              L3Current = round(random.uniform(base_current * 0.9, base_current * 1.1), 6)
+              
+              # Calculate three-phase power (P = √3 * VL * IL * PF)
+              # Assuming a power factor of 0.95 (typical for residential/commercial installations)
+              power_factor = 0.95
+              sqrt3 = math.sqrt(3)
+              instantaneous_power_kw = round(sqrt3 * ((L1Voltage * L1Current + 
+                                                  L2Voltage * L2Current + 
+                                                  L3Voltage * L3Current) / 3) * power_factor / 1000, 6)
+              
+              # Generate realistic frequency (typically ±0.5 Hz of nominal)
+              Frequency = round(random.uniform(nominal_frequency - 0.5, nominal_frequency + 0.5), 6) 
+              
+              return [
+                  {
+                      'Name': 'L1Voltage',
+                      'Value': str(L1Voltage),
+                      'Type': 'DOUBLE'
+                  },
+                  {
+                      'Name': 'L2Voltage',
+                      'Value': str(L2Voltage),
+                      'Type': 'DOUBLE'
+                  },
+                  {
+                      'Name': 'L3Voltage',
+                      'Value': str(L3Voltage),
+                      'Type': 'DOUBLE'
+                  },
+                  {
+                      'Name': 'L1Current',
+                      'Value': str(L1Current),
+                      'Type': 'DOUBLE'
+                  },
+                  {
+                      'Name': 'L2Current',
+                      'Value': str(L2Current),
+                      'Type': 'DOUBLE'
+                  },
+                  {
+                      'Name': 'L3Current',
+                      'Value': str(L3Current),
+                      'Type': 'DOUBLE'
+                  },
+                  {
+                      'Name': 'InstantaneousPower',
+                      'Value': str(instantaneous_power_kw),
+                      'Type': 'DOUBLE'
+                  },
+                  {
+                      'Name': 'Frequency',
+                      'Value': str(Frequency),
+                      'Type': 'DOUBLE'
+                  }
+              ]
+
+          def write_to_timestream(meter_id):
+              client = boto3.client('timestream-write')
+              
+              # Calculate start and end times
+              current_time = datetime.now()
+              start_time = current_time - timedelta(days=90)
+              
+              # Initialize batch of records
+              records = []
+              interval = timedelta(minutes=15)
+              
+              # Generate data for each 15-minute interval, starting from current time
+              while current_time >= start_time:
+                  timestamp = int(current_time.timestamp() * 1000)  # Convert to milliseconds
+                  
+                  record = {
+                      'Dimensions': [
+                          {'Name': 'MeterID', 'Value': meter_id}
+                      ],
+                      'Time': str(timestamp),
+                      'TimeUnit': 'MILLISECONDS',
+                      'MeasureName': 'interval',
+                      'MeasureValueType': 'MULTI',
+                      'MeasureValues': generate_realistic_measurements()
+                  }
+                  records.append(record)
+                  
+                  # Write records in batches of 100 (Timestream limit)
+                  if len(records) >= 100:
+                      try:
+                          client.write_records(
+                              DatabaseName='MeterData',
+                              TableName='IntervalData',
+                              Records=records
+                          )
+                          records = []  # Clear the batch after writing
+                      except Exception as e:
+                          return {
+                              'statusCode': 500,
+                              'body': f'Error writing to Timestream: {str(e)}'
+                          }
+                  
+                  # Move backwards by exactly 15 minutes
+                  current_time = current_time - interval
+              
+              # Write any remaining records
+              if records:
+                  try:
+                      client.write_records(
+                          DatabaseName='MeterData',
+                          TableName='IntervalData',
+                          Records=records
+                      )
+                  except Exception as e:
+                      return {
+                          'statusCode': 500,
+                          'body': f'Error writing to Timestream: {str(e)}'
+                      }
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Successfully wrote records to Timestream'
+              }
+
+          def populate_customer_billing_data():
+              try:
+                  # Initialize DynamoDB client
+                  dynamodb = boto3.resource('dynamodb')
+                  account_table = dynamodb.Table('AccountData')
+                  billing_table = dynamodb.Table('BillingData')
+          
+                  # Sample data for address generation
+                  streets = ['Oak Street', 'Maple Avenue', 'Pine Road', 'Cedar Lane', 'Elm Drive']
+                  cities = ['Springfield', 'Riverside', 'Lakewood', 'Hillside', 'Meadowbrook']
+                  states = ['CA', 'NY', 'TX', 'FL', 'WA']
+          
+                  # Generate 5 unique account numbers
+                  account_numbers = random.sample(range(100000, 999999), 5)
+          
+                  # Create customer records
+                  for i in range(5):
+                      account_number = str(account_numbers[i])
+                      meter_id = f"5524{i+1}"  # Create consistent meter IDs
+                      premise_number = f"P{random.randint(10000, 99999)}"
+                      zip_code = f"{random.randint(10000, 99999)}"
+          
+                      account_data = {
+                          'AccountNumber': account_number,
+                          'ServiceAddress': f"{random.randint(100, 9999)} {random.choice(streets)} {random.choice(cities)}, {random.choice(states)} {zip_code}",                          
+                          'RateCode': 'RESI',
+                          'MeterNumber': meter_id,
+                          'PremiseNumber': premise_number,
+                          'CustomerName': f"Customer {i+1}",
+                          'PhoneNumber': f"555-{random.randint(100,999)}-{random.randint(1000,9999)}",
+                          'EmailAddress': f"customer{i+1}@example.com"
+                      }
+          
+                      # Put account data
+                      account_table.put_item(Item=account_data)
+          
+                      # Generate billing data for each customer
+                      start_date = datetime(2024, 1, 1)
+                      for month in range(14):  # 14 months from Jan 2024 to Feb 2025
+                          current_date = start_date + timedelta(days=30*month)
+                          kwh_consumption = random.randint(800, 1200)  # Random kWh between 800-1200
+                          rate = 0.15  # $0.15 per kWh
+                          energy_charge = round(kwh_consumption * rate, 2)
+                          service_charge = 25.00  # Fixed monthly service charge
+                          total_bill = round(energy_charge + service_charge, 2)
+          
+                          billing_data = {
+                              'AccountNumber': account_number,
+                              'BillingDate': current_date.strftime('%Y-%m-%d'),
+                              'KWhConsumption': kwh_consumption,
+                              'EnergyCharge': Decimal(str(energy_charge)),
+                              'ServiceCharge': Decimal(str(service_charge)),
+                              'TotalAmount': Decimal(str(total_bill)),
+                              'DueDate': (current_date + timedelta(days=21)).strftime('%Y-%m-%d'),
+                              'BillingStatus': 'Issued'
+                          }
+          
+                          # Put billing data
+                          billing_table.put_item(Item=billing_data)
+
+                      # Write meter data for this customer
+                      write_to_timestream(meter_id)
+
+                  return {
+                      'statusCode': 200,
+                      'body': 'Successfully populated all data'
+                  }
+          
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': f'Error populating data: {str(e)}'
+                  }
+
+          def lambda_handler(event, context):
+              if 'RequestType' in event:
+                  try:
+                      if event['RequestType'] in ['Create', 'Update']:
+                          populate_customer_billing_data()
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  except Exception as e:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+                      return
+              else:
+                  return populate_customer_billing_data()
+
+  EnergyVirtualAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: "EnergyVirtualAgent"
+      AutoPrepare: True
+      Description: "Unified agent for handling all energy utility customer service requests"
+      Instruction: |
+        You are a helpful electric utility customer service agent assisting customers with questions about their account.
+        You should always respond in a friendly tone, use the customer's name when available, and express empathy when appropriate.
+        For customer requests that inolve a date or time range, always be sure to first check the current date and time before responding.
+        
+        You can help customers with:
+        1. Account Requests:
+          - Opening new accounts
+          - Retrieving account information
+          - Updating account information
+          - Closing accounts
+
+        Schema for the DynamoDB AccountData table:
+          - AccountNumber (partition key)
+          - CustomerName 
+          - ServiceAddress 
+          - RateCode 
+          - MeterNumber 
+          - PhoneNumber 
+          - EmailAddress 
+          - PremiseNumber 
+          - AccountStatus 
+
+        2. Billing Requests:
+          - Retrieving account balance
+          - Retrieving billing history
+          - Processing payments
+
+        Schema for the DynamoDB BillingData table:
+          - AccountNumber (partition key) 
+          - BillingDate (sort key) 
+          - KWhConsumption 
+          - EnergyCharge 
+          - ServiceCharge 
+          - TotalAmount 
+          - DueDate 
+          - BillingStatus 
+        
+        3. Energy Consumption:
+          - Retrieving energy consumption information
+          - Providing cost estimates based on energy consumption
+          - Explaining consumption patterns
+
+        Schema for the Timestream IntervalData table:
+          - MeterID (partition key)
+          - Time (timestamp)
+          - MeasureValues (multi)
+            - L1Voltage
+            - L2Voltage
+            - L3Voltage
+            - L1Current
+            - L2Current
+            - L3Current
+            - InstantaneousPower
+            - Frequency
+
+        4. Service Dispatch and Ticket Management:
+           - Creating service tickets
+           - Checking ticket status
+           - Retrieving all tickets for a given account
+           - Reporting outages
+           - Scheduling maintenance
+
+        Schema for the DynamoDB TicketData table:
+          - TicketNumber (partition key)
+          - AccountNumber
+          - TicketType
+          - Status
+          - Description
+          - CreationDate
+        
+        Resist the temptation to ask the user for input. Only do so after you have exhausted available actions.
+        Never ask the user for information that you already can retrieve yourself through available actions or already in given context.
+      
+      FoundationModel: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0'
+      IdleSessionTTLInSeconds: 300
+      AgentResourceRoleArn: !GetAtt EnergyVirtualAgentRole.Arn
+      GuardrailConfiguration:
+        GuardrailIdentifier: !GetAtt EnergyVirtualAgentGuardrailVersion.GuardrailId
+        GuardrailVersion: !GetAtt EnergyVirtualAgentGuardrailVersion.Version
+      ActionGroups:
+        - ActionGroupName: 'UserInputAction'
+          ParentActionGroupSignature: 'AMAZON.UserInput'
+          ActionGroupState: 'ENABLED'
+        - ActionGroupName: "AccountActionGroup"
+          Description: "Actions for account management"          
+          ActionGroupExecutor:
+            Lambda: !GetAtt EnergyAccountBillingFunction.Arn
+          FunctionSchema:
+            Functions:
+              - Name: "AccountOpenFunction"
+                Description: "Creates a new customer account"
+                Parameters:
+                  CustomerName:
+                    Type: "string"
+                    Description: "Full name of the customer"
+                    Required: true
+                  ServiceAddress:
+                    Type: "string"
+                    Description: "Service address for the account"
+                    Required: true
+                  PhoneNumber:
+                    Type: "string"
+                    Description: "Phone number"
+                    Required: true
+                  EmailAddress:
+                    Type: "string"
+                    Description: "Email address"
+                    Required: true
+              - Name: "GetAccountInfoFunction"
+                Description: "Retrieves account information"
+                Parameters:
+                  AccountNumber:
+                    Type: "string"
+                    Description: "Account number to retrieve information for"
+                    Required: true
+              - Name: "AccountUpdateFunction"
+                Description: "Updates account information"
+                Parameters:
+                  AccountNumber:
+                    Type: "string"
+                    Description: "Account number to update"
+                    Required: true
+                  ServiceAddress:
+                    Type: "string"
+                    Description: "New service address"
+                    Required: false
+                  PhoneNumber:
+                    Type: "string"
+                    Description: "New phone number"
+                    Required: false
+                  EmailAddress:
+                    Type: "string"
+                    Description: "New email address"
+                    Required: false
+              - Name: "AccountCloseFunction"
+                Description: "Closes an existing account"
+                Parameters:
+                  AccountNumber:
+                    Type: "string"
+                    Description: "Account number to close"
+                    Required: true
+        - ActionGroupName: "BillingActionGroup"
+          Description: "Actions for billing management"          
+          ActionGroupExecutor:
+            Lambda: !GetAtt EnergyAccountBillingFunction.Arn
+          FunctionSchema:
+            Functions:
+              - Name: "GetBillingHistory"
+                Description: "Retrieves billing history for an account"
+                Parameters:
+                  AccountNumber:
+                    Type: "string"
+                    Description: "Account number to retrieve billing history for"
+                    Required: true
+                  StartDate:
+                    Type: "string"
+                    Description: "Start date for billing history (YYYY-MM-DD)"
+                    Required: true
+                  EndDate:
+                    Type: "string"
+                    Description: "End date for billing history (YYYY-MM-DD)"
+                    Required: true
+              - Name: "BillingPayFunction"
+                Description: "Used to process a payment for a customer bill"
+                Parameters:
+                  AccountNumber:
+                    Type: "string"
+                    Description: "Account number to process payment for"
+                    Required: true
+                  Amount:
+                    Type: "number"
+                    Description: "Payment amount"
+                    Required: true
+        - ActionGroupName: "ConsumptionActionGroup"
+          Description: "Actions for energy consumption analysis"          
+          ActionGroupExecutor:
+            Lambda: !GetAtt EnergyConsumptionFunction.Arn
+          FunctionSchema:
+            Functions:
+              - Name: "EnergyConsumptionFunction"
+                Description: "Retrieves energy consumption data for a given meter and time period"
+                Parameters:
+                  MeterID:
+                    Type: "string"
+                    Description: "Meter ID to retrieve the energy consumption for"
+                    Required: true
+                  StartDate:
+                    Type: "string"
+                    Description: "The start date formatted as YYYY-MM-DDThh:mm:ss"
+                    Required: true
+                  EndDate:
+                    Type: "string"
+                    Description: "The end date formatted as YYYY-MM-DDThh:mm:ss"
+                    Required: true
+        - ActionGroupName: "TicketActionGroup"
+          Description: "Actions for ticket management"          
+          ActionGroupExecutor:
+            Lambda: !GetAtt EnergyDispatchFunction.Arn
+          FunctionSchema:
+            Functions:
+              - Name: "CreateTicketFunction"
+                Description: "Creates a new ticket"
+                Parameters:
+                  AccountNumber:
+                    Type: "string"
+                    Description: "Account number for the ticket"
+                    Required: true
+                  TicketType:
+                    Type: "string"
+                    Description: "Type of ticket (service_connect, vegetation, outage, high_bill_investigation)"
+                    Required: true
+                  Description:
+                    Type: "string"
+                    Description: "Description of the issue"
+                    Required: true
+              - Name: "GetTicketInfoFunction"
+                Description: "Retrieves ticket information"
+                Parameters:
+                  TicketNumber:
+                    Type: "string"
+                    Description: "Ticket number to retrieve information for"
+                    Required: true
+              - Name: "GetAccountTicketsFunction"
+                Description: "Retrieves all tickets for an account"
+                Parameters:
+                  AccountNumber:
+                    Type: "string"
+                    Description: "Account number to retrieve tickets for"
+                    Required: true
+        - ActionGroupName: "DateTimeActionGroup"
+          Description: "Retrieves the current date and time"          
+          ActionGroupExecutor:
+            Lambda: !GetAtt EnergyTimeFunction.Arn
+          FunctionSchema:
+            Functions:
+              - Name: "CheckDateTimeFunction"
+                Description: "Retrieves the current time in 'YYYY-MM-DDThh:mm:ss' format"
+  
+  EnergyVirtualAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EnergyVirtualAgentRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*'
+      Policies:
+        - PolicyName: AllowAccessToBedrockFoundationModels
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:InvokeModelWithResponseStream'
+                  - 'bedrock:GetFoundationModel'
+                  - 'bedrock:GetInferenceProfile'
+                  - 'bedrock:ApplyGuardrail'
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-5-haiku-20241022-v1:0'
+                  - 'arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0'
+                  - 'arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0'
+                  - 'arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0'
+                  - !Sub '${EnergyVirtualAgentGuardrail}'
+
+  EnergyVirtualAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentAliasName: "EnergyVirtualAgentAlias"
+      AgentId: !GetAtt EnergyVirtualAgent.AgentId
+
+  EnergyVirtualAgentGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: 'EnergyVirtualAgentGuardrail'
+      Description: 'Amazon Bedrock Guardrail for the Energy Virtual Agent'
+      BlockedInputMessaging: 'I apologize, but I cannot process that request as it contains content that violates our policies.'
+      BlockedOutputsMessaging: 'I apologize, but I cannot provide that information as it would violate our content policies.'
+      ContentPolicyConfig:
+        FiltersConfig:
+          - InputStrength: HIGH
+            OutputStrength: HIGH
+            Type: SEXUAL
+          - InputStrength: HIGH
+            OutputStrength: HIGH
+            Type: VIOLENCE
+          - InputStrength: HIGH
+            OutputStrength: HIGH
+            Type: HATE
+          - InputStrength: HIGH
+            OutputStrength: HIGH
+            Type: INSULTS
+          - InputStrength: HIGH
+            OutputStrength: HIGH
+            Type: MISCONDUCT
+      TopicPolicyConfig:
+        TopicsConfig:
+          - Definition: |
+              Investment advice refers to guidance or recommendations regarding the management 
+              or allocation of funds or assets with the goal of generating returns or 
+              achieving specific financial objectives.
+            Name: 'Investments'
+            Type: 'DENY'
+      WordPolicyConfig:
+        ManagedWordListsConfig:
+          - Type: 'PROFANITY'
+
+  EnergyVirtualAgentGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !Ref EnergyVirtualAgentGuardrail
+      Description: "Energy Virtual Agent guardrail"
+
+  EnergyTimeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EnergyTimeFunction
+      Description: Energy virtual agent function to determine the current time
+      Handler: index.lambda_handler
+      Role: !GetAtt EnergyTimeFunctionRole.Arn
+      Code:
+        ZipFile: |
+          # Import statements
+          from datetime import datetime
+
+          # Parse parameters from dictionary list
+          def parse_params(params):
+              result = {}
+
+              for param in params:
+                  name = param["name"]
+                  value = param["value"]
+                  param_type = param["type"]
+                  if param_type == "integer":
+                      result[name] = int(value)
+                  elif param_type == "boolean":
+                      result[name] = value.lower() == "true"
+                  elif param_type == "number":
+                      result[name] = float(value)
+                  else:
+                      result[name] = value
+
+              return result
+              
+          # Get current time
+          def get_current_time():
+              current_time = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+              return current_time
+
+          # Main Lambda function handler
+          def lambda_handler(event, context):
+              
+              # Set variables based on input event
+              message_version = event["messageVersion"]
+              input_text = event["inputText"]
+              agent = event["agent"]
+              actionGroup = event["actionGroup"]
+              function = event["function"]
+              parameters = parse_params(event.get("parameters", []))
+
+              # Print agent and input_text
+              print(f"Agent Name: {agent['name']}")
+              print(f"Input Text: {input_text}")
+
+              # Print function parameters
+              print(f"Input Parameters: {parameters}")
+
+              # Check action group and function name
+              if actionGroup == "DateTimeActionGroup":
+                  if function == "CheckDateTimeFunction":
+                      current_time = get_current_time()
+              
+              else:
+                  raise ValueError(f"Unrecognized Action Group: {actionGroup}")
+
+              # Build response_body
+              response_body = {"TEXT": {"body": current_time}}
+
+              # Build function_response
+              function_response = {
+                  "actionGroup": actionGroup,
+                  "function": function,
+                  "functionResponse": {"responseBody": response_body},
+              }
+
+              # Set session and prompt attributes
+              session_attributes = event['sessionAttributes']
+              prompt_session_attributes = event['promptSessionAttributes']
+
+              # Build action_response
+              action_response = {
+                  "response": function_response,
+                  "messageVersion": message_version,
+                  'sessionAttributes': session_attributes,
+                  'promptSessionAttributes': prompt_session_attributes
+              }
+
+              # Print response
+              print("Response: {}".format(action_response))
+
+              # Return action_response
+              return action_response
+      Runtime: python3.12
+      Timeout: 5
+      MemorySize: 128
+
+  EnergyTimeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EnergyTimeFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  EnergyTimeFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EnergyTimeFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'bedrock.amazonaws.com'
+      SourceArn: !GetAtt EnergyVirtualAgent.AgentArn
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  EnergyConsumptionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "EnergyConsumptionFunction"
+      Description: Energy virtual agent function for handling energy consumption requests
+      Handler: "index.lambda_handler"
+      Role: !GetAtt EnergyConsumptionFunctionRole.Arn
+      Code:
+        ZipFile: |
+          # Import statements
+          import boto3
+
+          # Parse parameters from dictionary list
+          def parse_params(params):
+              result = {}
+
+              for param in params:
+                  name = param["name"]
+                  value = param["value"]
+                  param_type = param["type"]
+                  if param_type == "integer":
+                      result[name] = int(value)
+                  elif param_type == "boolean":
+                      result[name] = value.lower() == "true"
+                  elif param_type == "number":
+                      result[name] = float(value)
+                  else:
+                      result[name] = value
+
+              return result
+
+          # Query Timestream for consumption data
+          def query_timestream(meter_id, start_date, end_date):
+              
+              # Build Timestream query
+              query = f"""
+              SELECT 
+                  MeterID,
+                  ROUND(SUM(InstantaneousPower) / 4, 2) as total_kwh
+              FROM "MeterData"."IntervalData"
+              WHERE MeterID = '{meter_id}'
+                  AND time BETWEEN FROM_ISO8601_TIMESTAMP('{start_date}') 
+                  AND FROM_ISO8601_TIMESTAMP('{end_date}')
+              GROUP BY MeterID
+              """
+              
+              # Execute Timestream query
+              try:
+                  client = boto3.client('timestream-query')
+                  response = client.query(QueryString=query)
+                  
+                  if len(response['Rows']) > 0:
+                      return float(response['Rows'][0]['Data'][1]['ScalarValue'])
+                  return 0.0
+                  
+              except Exception as e:
+                  print(f"Error executing query: {str(e)}")
+                  raise
+
+          # Calculate energy consumption
+          def get_total_energy_consumption(meter_id, start_date, end_date):
+              
+              # Call query_timestream function
+              consumption = query_timestream(meter_id, start_date, end_date)
+              
+              # Calculate cost
+              cost = round(consumption * 0.1323, 2)
+              
+              # Return consumption and cost
+              return f"From {start_date} to {end_date} you used {consumption} kWh of energy which has an estimated cost of ${cost}."
+
+          # Main Lambda function handler
+          def lambda_handler(event, context):
+              
+              # Set variables based on input event
+              message_version = event["messageVersion"]
+              input_text = event["inputText"]
+              agent = event["agent"]
+              actionGroup = event["actionGroup"]
+              function = event["function"]
+              parameters = parse_params(event.get("parameters", []))
+
+              # Print agent and input_text
+              print(f"Agent Name: {agent['name']}")
+              print(f"Input Text: {input_text}")
+
+              # Print function parameters
+              print(f"Input Parameters: {parameters}")
+
+              # Check action group and function name
+              if actionGroup == "ConsumptionActionGroup":
+                  if function == "EnergyConsumptionFunction":
+                      consumption = get_total_energy_consumption(
+                          parameters["MeterID"],
+                          parameters["StartDate"],
+                          parameters["EndDate"]
+                      )
+              
+              else:
+                  raise ValueError(f"Unrecognized Action Group: {actionGroup}")
+
+              # Build response_body
+              response_body = {"TEXT": {"body": consumption}}
+
+              # Build function_response
+              function_response = {
+                  "actionGroup": actionGroup,
+                  "function": function,
+                  "functionResponse": {"responseBody": response_body},
+              }
+
+              # Set session and prompt attributes
+              session_attributes = event['sessionAttributes']
+              prompt_session_attributes = event['promptSessionAttributes']
+
+              # Build action_response
+              action_response = {
+                  "response": function_response,
+                  "messageVersion": message_version,
+                  'sessionAttributes': session_attributes,
+                  'promptSessionAttributes': prompt_session_attributes
+              }
+
+              # Print response
+              print("Response: {}".format(action_response))
+
+              # Return action_response
+              return action_response
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 128
+
+  EnergyConsumptionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EnergyConsumptionFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowAccessToTimestream
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - timestream:Select
+                Resource: !GetAtt MeterDataTimestreamTable.Arn
+              - Effect: Allow
+                Action:
+                  - timestream:DescribeEndpoints
+                Resource: "*"
+        
+  EnergyConsumptionFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EnergyConsumptionFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'bedrock.amazonaws.com'
+      SourceArn: !GetAtt EnergyVirtualAgent.AgentArn
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  EnergyAccountBillingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "EnergyAccountBillingFunction"
+      Description: Energy virtual agent function for handling account and billing requests
+      Handler: "index.lambda_handler"
+      Role: !GetAtt EnergyAccountBillingFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import uuid
+          from datetime import datetime
+          from decimal import Decimal
+
+          def parse_params(params):
+              result = {}
+              for param in params:
+                  name = param["name"]
+                  value = param["value"]
+                  param_type = param["type"]
+                  if param_type == "integer":
+                      result[name] = int(value)
+                  elif param_type == "boolean":
+                      result[name] = value.lower() == "true"
+                  elif param_type == "number":
+                      result[name] = float(value)
+                  else:
+                      result[name] = value
+              return result
+
+          def create_account(params):
+              dynamodb = boto3.resource('dynamodb')
+              account_table = dynamodb.Table('AccountData')
+              
+              # Generate unique account number and meter ID
+              account_number = str(uuid.uuid4().int)[:6]
+              meter_id = f"55{account_number[-3:]}"
+              premise_number = f"P{str(uuid.uuid4().int)[:5]}"
+              
+              account_data = {
+                  'AccountNumber': account_number,
+                  'CustomerName': params['CustomerName'],
+                  'ServiceAddress': params['ServiceAddress'],                  
+                  'PhoneNumber': params['PhoneNumber'],
+                  'EmailAddress': params['EmailAddress'],
+                  'RateCode': 'RESI',
+                  'MeterNumber': meter_id,
+                  'PremiseNumber': premise_number,
+                  'CreationDate': datetime.now().strftime('%Y-%m-%d')
+              }
+              
+              account_table.put_item(Item=account_data)
+              return f"Account created successfully. Your account number is {account_number}"
+
+          def get_account_info(params):
+              dynamodb = boto3.resource('dynamodb')
+              account_table = dynamodb.Table('AccountData')
+              
+              response = account_table.get_item(
+                  Key={'AccountNumber': params['AccountNumber']}
+              )
+              
+              if 'Item' not in response:
+                  return "Account not found"
+                  
+              account = response['Item']
+              return (f"Account Information:\n"
+                     f"Name: {account['CustomerName']}\n"
+                     f"Service Address: {account['ServiceAddress']}\n"                     
+                     f"Phone: {account['PhoneNumber']}\n"
+                     f"Email: {account['EmailAddress']}\n"
+                     f"Meter Number: {account['MeterNumber']}")
+
+          def get_billing_history(params):
+              dynamodb = boto3.resource('dynamodb')
+              billing_table = dynamodb.Table('BillingData')
+              
+              response = billing_table.query(
+                  KeyConditionExpression='AccountNumber = :acc AND BillingDate BETWEEN :start AND :end',
+                  ExpressionAttributeValues={
+                      ':acc': params['AccountNumber'],
+                      ':start': params['StartDate'],
+                      ':end': params['EndDate']
+                  }
+              )
+              
+              if not response['Items']:
+                  return "No billing history found for the specified period"
+                  
+              bills = response['Items']
+              result = "Billing History:\n"
+              for bill in bills:
+                  result += (f"Date: {bill['BillingDate']}\n"
+                           f"Amount: ${float(bill['TotalAmount']):.2f}\n"
+                           f"Usage: {bill['KWhConsumption']} kWh\n"
+                           f"Status: {bill['BillingStatus']}\n"
+                           f"Due Date: {bill['DueDate']}\n\n")
+              return result
+
+          def update_account(params):
+              dynamodb = boto3.resource('dynamodb')
+              account_table = dynamodb.Table('AccountData')
+              
+              update_expr = "SET "
+              expr_values = {}
+              expr_names = {}
+              
+              if 'ServiceAddress' in params:
+                  update_expr += "#addr = :addr, "
+                  expr_values[':addr'] = params['ServiceAddress']
+                  expr_names['#addr'] = 'ServiceAddress'
+              
+              if 'PhoneNumber' in params:
+                  update_expr += "PhoneNumber = :phone, "
+                  expr_values[':phone'] = params['PhoneNumber']
+                  
+              if 'EmailAddress' in params:
+                  update_expr += "EmailAddress = :email, "
+                  expr_values[':email'] = params['EmailAddress']
+              
+              if not expr_values:
+                  return "No updates provided"
+                  
+              update_expr = update_expr.rstrip(", ")
+              
+              update_params = {
+                  'Key': {'AccountNumber': params['AccountNumber']},
+                  'UpdateExpression': update_expr,
+                  'ExpressionAttributeValues': expr_values
+              }
+              
+              # Only include ExpressionAttributeNames if we have name mappings
+              if expr_names:
+                  update_params['ExpressionAttributeNames'] = expr_names
+              
+              account_table.update_item(**update_params)
+              
+              return "Account updated successfully"
+
+          def close_account(params):
+              dynamodb = boto3.resource('dynamodb')
+              account_table = dynamodb.Table('AccountData')
+              
+              account_table.update_item(
+                  Key={'AccountNumber': params['AccountNumber']},
+                  UpdateExpression="SET AccountStatus = :status",
+                  ExpressionAttributeValues={':status': 'Closed'}
+              )
+              
+              return f"Account {params['AccountNumber']} has been closed"
+
+          def process_payment(params):
+              dynamodb = boto3.resource('dynamodb')
+              billing_table = dynamodb.Table('BillingData')
+              
+              # Mock credit card payment processing
+              payment_amount = params['Amount']
+              account_number = params['AccountNumber']
+              
+              # Update billing record
+              billing_table.update_item(
+                  Key={
+                      'AccountNumber': account_number,
+                      'BillingDate': datetime.now().strftime('%Y-%m-%d')
+                  },
+                  UpdateExpression="SET PaymentAmount = :amt, PaymentDate = :date, BillingStatus = :status",
+                  ExpressionAttributeValues={
+                      ':amt': Decimal(str(payment_amount)),
+                      ':date': datetime.now().strftime('%Y-%m-%d'),
+                      ':status': 'Paid'
+                  }
+              )
+              
+              return f"Payment of ${payment_amount:.2f} processed successfully for account {account_number}"
+
+          def lambda_handler(event, context):
+              message_version = event["messageVersion"]
+              input_text = event["inputText"]
+              agent = event["agent"]
+              actionGroup = event["actionGroup"]
+              function = event["function"]
+              parameters = parse_params(event.get("parameters", []))
+              
+              print(f"Agent Name: {agent['name']}")
+              print(f"Input Text: {input_text}")
+              print(f"Input Parameters: {parameters}")
+              
+              if actionGroup == "AccountActionGroup":
+                  if function == "AccountOpenFunction":
+                      result = create_account(parameters)
+                  elif function == "GetAccountInfoFunction":
+                      result = get_account_info(parameters)
+                  elif function == "AccountUpdateFunction":
+                      result = update_account(parameters)
+                  elif function == "AccountCloseFunction":
+                      result = close_account(parameters)
+                  else:
+                      raise ValueError(f"Unrecognized function: {function}")
+              elif actionGroup == "BillingActionGroup":
+                  if function == "GetBillingHistory":
+                      result = get_billing_history(parameters)
+                  elif function == "BillingPayFunction":
+                      result = process_payment(parameters)
+                  else:
+                      raise ValueError(f"Unrecognized function: {function}")
+              else:
+                  raise ValueError(f"Unrecognized Action Group: {actionGroup}")
+              
+              response_body = {"TEXT": {"body": result}}
+              
+              function_response = {
+                  "actionGroup": actionGroup,
+                  "function": function,
+                  "functionResponse": {"responseBody": response_body},
+              }
+              
+              action_response = {
+                  "response": function_response,
+                  "messageVersion": message_version,
+                  'sessionAttributes': event['sessionAttributes'],
+                  'promptSessionAttributes': event['promptSessionAttributes']
+              }
+              
+              print("Response: {}".format(action_response))
+              return action_response
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 128
+
+  EnergyAccountBillingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EnergyAccountBillingFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: 
+                  - !GetAtt AccountDynamoDBTable.Arn
+                  - !GetAtt BillingDynamoDBTable.Arn
+
+  EnergyAccountBillingFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EnergyAccountBillingFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'bedrock.amazonaws.com'
+      SourceArn: !GetAtt EnergyVirtualAgent.AgentArn
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  EnergyDispatchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "EnergyDispatchFunction"
+      Description: Energy virtual agent function for handling energy dispatch and ticket management
+      Handler: "index.lambda_handler"
+      Role: !GetAtt EnergyDispatchFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import uuid
+          from datetime import datetime
+
+          def parse_params(params):
+              result = {}
+              for param in params:
+                  name = param["name"]
+                  value = param["value"]
+                  param_type = param["type"]
+                  if param_type == "integer":
+                      result[name] = int(value)
+                  elif param_type == "boolean":
+                      result[name] = value.lower() == "true"
+                  elif param_type == "number":
+                      result[name] = float(value)
+                  else:
+                      result[name] = value
+              return result
+
+          def create_ticket(params):
+              dynamodb = boto3.resource('dynamodb')
+              ticket_table = dynamodb.Table('TicketData')
+              
+              ticket_number = f"T-{str(uuid.uuid4().int)[:8]}"
+              creation_date = datetime.now().strftime('%Y-%m-%d')
+              
+              ticket_data = {
+                  'TicketNumber': ticket_number,
+                  'AccountNumber': params['AccountNumber'],
+                  'TicketType': params['TicketType'],
+                  'Description': params['Description'],
+                  'CreationDate': creation_date,
+                  'Status': 'Open'
+              }
+              
+              ticket_table.put_item(Item=ticket_data)
+              return f"Ticket created successfully. Your ticket number is {ticket_number}"
+
+          def get_ticket_info(params):
+              dynamodb = boto3.resource('dynamodb')
+              ticket_table = dynamodb.Table('TicketData')
+              
+              response = ticket_table.get_item(
+                  Key={'TicketNumber': params['TicketNumber']}
+              )
+              
+              if 'Item' not in response:
+                  return "Ticket not found"
+                  
+              ticket = response['Item']
+              return (f"Ticket Information:\n"
+                      f"Ticket Number: {ticket['TicketNumber']}\n"
+                      f"Account Number: {ticket['AccountNumber']}\n"
+                      f"Type: {ticket['TicketType']}\n"
+                      f"Description: {ticket['Description']}\n"
+                      f"Creation Date: {ticket['CreationDate']}\n"
+                      f"Status: {ticket['Status']}")
+
+          def get_account_tickets(params):
+              dynamodb = boto3.resource('dynamodb')
+              ticket_table = dynamodb.Table('TicketData')
+              
+              response = ticket_table.query(
+                  IndexName='AccountTicketsIndex',
+                  KeyConditionExpression='AccountNumber = :acc',
+                  ExpressionAttributeValues={
+                      ':acc': params['AccountNumber']
+                  }
+              )
+              
+              if not response['Items']:
+                  return "No tickets found for this account"
+                  
+              tickets = response['Items']
+              result = "Account Tickets:\n"
+              for ticket in tickets:
+                  result += (f"Ticket Number: {ticket['TicketNumber']}\n"
+                             f"Type: {ticket['TicketType']}\n"
+                             f"Creation Date: {ticket['CreationDate']}\n"
+                             f"Status: {ticket['Status']}\n\n")
+              return result
+
+          def lambda_handler(event, context):
+              message_version = event["messageVersion"]
+              input_text = event["inputText"]
+              agent = event["agent"]
+              actionGroup = event["actionGroup"]
+              function = event["function"]
+              parameters = parse_params(event.get("parameters", []))
+              
+              print(f"Agent Name: {agent['name']}")
+              print(f"Input Text: {input_text}")
+              print(f"Input Parameters: {parameters}")
+              
+              if actionGroup == "TicketActionGroup":
+                  if function == "CreateTicketFunction":
+                      result = create_ticket(parameters)
+                  elif function == "GetTicketInfoFunction":
+                      result = get_ticket_info(parameters)
+                  elif function == "GetAccountTicketsFunction":
+                      result = get_account_tickets(parameters)
+                  else:
+                      raise ValueError(f"Unrecognized function: {function}")
+              else:
+                  raise ValueError(f"Unrecognized Action Group: {actionGroup}")
+              
+              response_body = {"TEXT": {"body": result}}
+              
+              function_response = {
+                  "actionGroup": actionGroup,
+                  "function": function,
+                  "functionResponse": {"responseBody": response_body},
+              }
+              
+              action_response = {
+                  "response": function_response,
+                  "messageVersion": message_version,
+                  'sessionAttributes': event['sessionAttributes'],
+                  'promptSessionAttributes': event['promptSessionAttributes']
+              }
+              
+              print("Response: {}".format(action_response))
+              return action_response
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 128
+
+  EnergyDispatchFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EnergyDispatchFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowDynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                Resource: 
+                  - !GetAtt TicketDynamoDBTable.Arn
+                  - !Sub '${TicketDynamoDBTable.Arn}/index/AccountTicketsIndex'
+                
+  EnergyDispatchFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EnergyDispatchFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: 'bedrock.amazonaws.com'
+      SourceArn: !GetAtt EnergyVirtualAgent.AgentArn
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  EnergyVirtualAgentLexBotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lexv2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowAccessToBedrockAgent
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - bedrock:InvokeAgent
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:agent-alias/${EnergyVirtualAgent.AgentId}/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref 'AWS::AccountId'
+        - PolicyName: AllowAccessToPolly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - polly:SynthesizeSpeech
+                Resource: 
+                  - '*'
+
+  EnergyVirtualAgentLexBot:
+    Type: AWS::Lex::Bot
+    Properties:
+      Name: 'EnergyVirtualAgentLexBot'
+      Description: 'Energy Virtual Agent Lex Bot'
+      RoleArn: !GetAtt EnergyVirtualAgentLexBotRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      BotLocales:
+        - LocaleId: en_US
+          NluConfidenceThreshold: 0.40
+          VoiceSettings:
+            VoiceId: Matthew
+          Intents:
+            - Name: 'FallbackIntent'
+              Description: 'Default fallback intent'
+              ParentIntentSignature: 'AMAZON.FallbackIntent'
+            - Name: 'SpeakToAgentIntent'
+              Description: 'Intent to handle agent transfer requests'
+              SampleUtterances:
+                - Utterance: 'I want to speak to an agent'
+                - Utterance: 'Agent'
+                - Utterance: "I'd like to speak with an agent"
+                - Utterance: "I'd like to speak with a representative"
+                - Utterance: 'Customer service'
+                - Utterance: 'Representative'
+              FulfillmentCodeHook:
+                Enabled: false
+              IntentClosingSetting:
+                ClosingResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: 'Okay, an agent will be with you shortly'
+            - Name: 'GoodbyeIntent'
+              Description: 'Intent to handle goodbye requests'
+              SampleUtterances:
+                - Utterance: "That's all I need thank you"
+                - Utterance: 'Goodbye'
+                - Utterance: "That's what I needed"
+                - Utterance: 'Thank you'
+          SlotTypes: []
+      TestBotAliasSettings:
+        BotAliasLocaleSettings:
+          - LocaleId: en_US
+            BotAliasLocaleSetting:
+              Enabled: true
+
+  EnergyVirtualAgentLexBotVersion:
+    Type: AWS::Lex::BotVersion
+    DependsOn: EnergyVirtualAgentLexBot
+    Properties:
+      BotId: !Ref EnergyVirtualAgentLexBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+
+  EnergyVirtualAgentLexBotAlias:
+    Type: AWS::Lex::BotAlias
+    DependsOn: EnergyVirtualAgentLexBotVersion
+    Properties:
+      BotAliasName: 'PROD'
+      BotId: !Ref EnergyVirtualAgentLexBot
+      BotAliasLocaleSettings:
+        - LocaleId: en_US
+          BotAliasLocaleSetting:
+            Enabled: true
+      SentimentAnalysisSettings:
+        DetectSentiment: false
+
+  CustomResourcePopulateData:
+    Type: Custom::PopulateData
+    DependsOn: 
+      - AccountDynamoDBTable
+      - BillingDynamoDBTable
+      - MeterDataTimestreamTable
+    Properties:
+      ServiceToken: !GetAtt PopulateDataFunction.Arn
+      InvocationTime: !Sub '${AWS::StackName}-${AWS::Region}'
+
+  ConnectBotAssociation:
+    Type: AWS::Connect::IntegrationAssociation
+    Properties:
+      InstanceId: !Ref ConnectInstanceArn
+      IntegrationArn: !GetAtt EnergyVirtualAgentLexBotAlias.Arn
+      IntegrationType: LEX_BOT
+
+  ConnectContactFlow:
+    Type: AWS::Connect::ContactFlow
+    Properties:
+      Description: 'Energy Virtual Agent Flow'
+      InstanceArn: !Ref ConnectInstanceArn
+      Name: 'EnergyVirtualAgentFlow'
+      Type: CONTACT_FLOW
+      Content: !Sub |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "Enable Logging",
+          "Metadata": {
+            "entryPointPosition": {
+              "x": -236.8,
+              "y": 102.4
+            },
+            "ActionMetadata": {
+              "Set Language": {
+                "position": {
+                  "x": 119.2,
+                  "y": 101.6
+                },
+                "isFriendlyName": true,
+                "children": [
+                  "Set Language-sXafvLzH9B"
+                ],
+                "overrideConsoleVoice": false,
+                "fragments": {
+                  "SetContactData": "Set Language-sXafvLzH9B"
+                },
+                "overrideLanguageAttribute": true
+              },
+              "Set Language-sXafvLzH9B": {
+                "position": {
+                  "x": 119.2,
+                  "y": 101.6
+                },
+                "isFriendlyName": true,
+                "dynamicParams": []
+              },
+              "Goodbye Prompt": {
+                "position": {
+                  "x": 1322.4,
+                  "y": 274.4
+                },
+                "isFriendlyName": true
+              },
+              "Queue at Capacity": {
+                "position": {
+                  "x": 1082.4,
+                  "y": 104
+                },
+                "isFriendlyName": true
+              },
+              "Transfer to Queue": {
+                "position": {
+                  "x": 840,
+                  "y": 102.4
+                },
+                "isFriendlyName": true
+              },
+              "Set Queue": {
+                "position": {
+                  "x": 600,
+                  "y": 100.8
+                },
+                "isFriendlyName": true,
+                "parameters": {
+                  "QueueId": {
+                    "displayName": "BasicQueue"
+                  }
+                },
+                "queue": {
+                  "text": "BasicQueue"
+                }
+              },
+              "d5d82a97-0a9a-40f1-9dde-d26f56db7ff2": {
+                "position": {
+                  "x": 1322.4,
+                  "y": 104
+                }
+              },
+              "Main Menu": {
+                "position": {
+                  "x": 360,
+                  "y": 98.4
+                },
+                "isFriendlyName": true,
+                "parameters": {
+                  "LexV2Bot": {
+                    "AliasArn": {
+                      "displayName": "PROD",
+                      "useLexBotDropdown": true,
+                      "lexV2BotName": "EnergyVirtualAgentLexBot"
+                    }
+                  }
+                },
+                "useLexBotDropdown": true,
+                "lexV2BotName": "EnergyVirtualAgentLexBot",
+                "lexV2BotAliasName": "PROD",
+                "conditionMetadata": [
+                  {
+                    "id": "128183be-5de6-4858-b1f8-0b921fbabeb6",
+                    "operator": {
+                      "name": "Equals",
+                      "value": "Equals",
+                      "shortDisplay": "="
+                    },
+                    "value": "EnergyVirtualAgentIntent"
+                  },
+                  {
+                    "id": "6abf49a6-f8b4-43c1-ba26-25fd31d72f36",
+                    "operator": {
+                      "name": "Equals",
+                      "value": "Equals",
+                      "shortDisplay": "="
+                    },
+                    "value": "SpeakToAgentIntent"
+                  },
+                  {
+                    "id": "9d11101e-8716-4c4e-99a1-4b3415e5f1cd",
+                    "operator": {
+                      "name": "Equals",
+                      "value": "Equals",
+                      "shortDisplay": "="
+                    },
+                    "value": "GoodbyeIntent"
+                  }
+                ]
+              },
+              "Error Prompt": {
+                "position": {
+                  "x": 1324,
+                  "y": 503.2
+                },
+                "isFriendlyName": true
+              },
+              "Enable Logging": {
+                "position": {
+                  "x": -121.6,
+                  "y": 101.6
+                },
+                "isFriendlyName": true
+              }
+            },
+            "Annotations": [],
+            "name": "01_Main",
+            "description": "Energy Virtual Agent Flow",
+            "type": "contactFlow",
+            "status": "PUBLISHED",
+            "hash": {}
+          },
+          "Actions": [
+            {
+              "Parameters": {
+                "TextToSpeechVoice": "Matthew"
+              },
+              "Identifier": "Set Language",
+              "Type": "UpdateContactTextToSpeechVoice",
+              "Transitions": {
+                "NextAction": "Set Language-sXafvLzH9B"
+              }
+            },
+            {
+              "Parameters": {
+                "LanguageCode": "en-US"
+              },
+              "Identifier": "Set Language-sXafvLzH9B",
+              "Type": "UpdateContactData",
+              "Transitions": {
+                "NextAction": "Main Menu",
+                "Errors": [
+                  {
+                    "NextAction": "Main Menu",
+                    "ErrorType": "NoMatchingError"
+                  }
+                ]
+              }
+            },
+            {
+              "Parameters": {
+                "Text": "Thank you for contacting ABC Energy. We hope you have a great day!"
+              },
+              "Identifier": "Goodbye Prompt",
+              "Type": "MessageParticipant",
+              "Transitions": {
+                "NextAction": "d5d82a97-0a9a-40f1-9dde-d26f56db7ff2",
+                "Errors": [
+                  {
+                    "NextAction": "d5d82a97-0a9a-40f1-9dde-d26f56db7ff2",
+                    "ErrorType": "NoMatchingError"
+                  }
+                ]
+              }
+            },
+            {
+              "Parameters": {
+                "Text": "We are experiencing higher than normal call valumes and are unable to queu your call. Please try again later."
+              },
+              "Identifier": "Queue at Capacity",
+              "Type": "MessageParticipant",
+              "Transitions": {
+                "NextAction": "d5d82a97-0a9a-40f1-9dde-d26f56db7ff2",
+                "Errors": [
+                  {
+                    "NextAction": "Error Prompt",
+                    "ErrorType": "NoMatchingError"
+                  }
+                ]
+              }
+            },
+            {
+              "Parameters": {},
+              "Identifier": "Transfer to Queue",
+              "Type": "TransferContactToQueue",
+              "Transitions": {
+                "NextAction": "Error Prompt",
+                "Errors": [
+                  {
+                    "NextAction": "Queue at Capacity",
+                    "ErrorType": "QueueAtCapacity"
+                  },
+                  {
+                    "NextAction": "Error Prompt",
+                    "ErrorType": "NoMatchingError"
+                  }
+                ]
+              }
+            },
+            {
+              "Parameters": {
+                "QueueId": "${ConnectQueueArn}"
+              },
+              "Identifier": "Set Queue",
+              "Type": "UpdateContactTargetQueue",
+              "Transitions": {
+                "NextAction": "Transfer to Queue",
+                "Errors": [
+                  {
+                    "NextAction": "Error Prompt",
+                    "ErrorType": "NoMatchingError"
+                  }
+                ]
+              }
+            },
+            {
+              "Parameters": {},
+              "Identifier": "d5d82a97-0a9a-40f1-9dde-d26f56db7ff2",
+              "Type": "DisconnectParticipant",
+              "Transitions": {}
+            },
+            {
+              "Parameters": {
+                "Text": "Thank you for calling ABC Energy. I'm Matthew, a virtual energy assistant, and I can handle tasks like opening new accounts, updating account information, processing bill payments, retrieving energy consumption information, and interacting with our service dispatch system. If at any time you would like to speak with one of our representatives, please just say so. How may I help you today?",
+                "LexV2Bot": {
+                  "AliasArn": "${EnergyVirtualAgentLexBotAlias.Arn}"
+                }
+              },
+              "Identifier": "Main Menu",
+              "Type": "ConnectParticipantWithLexBot",
+              "Transitions": {
+                "NextAction": "Error Prompt",
+                "Conditions": [
+                  {
+                    "NextAction": "Goodbye Prompt",
+                    "Condition": {
+                      "Operator": "Equals",
+                      "Operands": [
+                        "EnergyVirtualAgentIntent"
+                      ]
+                    }
+                  },
+                  {
+                    "NextAction": "Set Queue",
+                    "Condition": {
+                      "Operator": "Equals",
+                      "Operands": [
+                        "SpeakToAgentIntent"
+                      ]
+                    }
+                  },
+                  {
+                    "NextAction": "Goodbye Prompt",
+                    "Condition": {
+                      "Operator": "Equals",
+                      "Operands": [
+                        "GoodbyeIntent"
+                      ]
+                    }
+                  }
+                ],
+                "Errors": [
+                  {
+                    "NextAction": "Goodbye Prompt",
+                    "ErrorType": "NoMatchingCondition"
+                  },
+                  {
+                    "NextAction": "Error Prompt",
+                    "ErrorType": "NoMatchingError"
+                  }
+                ]
+              }
+            },
+            {
+              "Parameters": {
+                "Text": "Something went wrong. Please try again later. Goodbye."
+              },
+              "Identifier": "Error Prompt",
+              "Type": "MessageParticipant",
+              "Transitions": {
+                "NextAction": "d5d82a97-0a9a-40f1-9dde-d26f56db7ff2",
+                "Errors": [
+                  {
+                    "NextAction": "d5d82a97-0a9a-40f1-9dde-d26f56db7ff2",
+                    "ErrorType": "NoMatchingError"
+                  }
+                ]
+              }
+            },
+            {
+              "Parameters": {
+                "FlowLoggingBehavior": "Enabled"
+              },
+              "Identifier": "Enable Logging",
+              "Type": "UpdateFlowLoggingBehavior",
+              "Transitions": {
+                "NextAction": "Set Language"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  EnergyVirtualAgentId:
+    Description: 'EnergyVirtualAgent ID'
+    Value: !GetAtt EnergyVirtualAgent.AgentId
+
+  EnergyVirtualAgentAliasId:
+    Description: 'EnergyVirtualAgent Alias ID'
+    Value: !GetAtt EnergyVirtualAgentAlias.AgentAliasId
